@@ -57,12 +57,40 @@ DEFAULT_CONFIG = {
 CONFIG_PATH = APP_DIR / "config.json"
 
 PUNCT_MAP = {
+    # Chinese punctuation
     "，": "逗号", "。": "句号", "！": "感叹号", "？": "问号",
     "：": "冒号", "；": "分号", "、": "顿号",
     "\u201c": "引号", "\u201d": "引号",
+    "\u300a": "书名号", "\u300b": "书名号",
     "\uff08": "左括号", "\uff09": "右括号",
+    "——": "破折号",
+    # English punctuation
+    ".": "点", ",": "逗号", "!": "感叹号", "?": "问号",
+    ":": "冒号", ";": "分号", "'": "引号", "\"": "引号",
+    "(": "左括号", ")": "右括号",
+    "[": "左括号", "]": "右括号",
+    "{": "左括号", "}": "右括号",
+    "-": "横线", "_": "下划线",
+    "/": "斜杠", "\\": "反斜杠",
+    "@": "at", "#": "井号", "$": "美元", "%": "百分号",
+    "&": "和", "*": "星号", "+": "加号", "=": "等号",
+    "<": "小于", ">": "大于", "|": "竖线",
+    "~": "波浪号", "^": "脱字符", "`": "反引号",
+    # Whitespace
     "\n": "另起一段，空两格",
+    "\t": "空格",
 }
+
+def _is_speakable(ch: str) -> bool:
+    """Check if a character can be spoken directly by TTS (letters, digits, Chinese)."""
+    cp = ord(ch)
+    # Chinese unified ideographs
+    if 0x4E00 <= cp <= 0x9FFF:
+        return True
+    # Basic Latin letters and digits
+    if 'A' <= ch <= 'Z' or 'a' <= ch <= 'z' or '0' <= ch <= '9':
+        return True
+    return False
 
 
 class Config:
@@ -177,6 +205,10 @@ class AudioManager:
         """Generate WAV for a single character, return filepath or None."""
         ch_stripped = ch.strip()
         if ch_stripped == "" and ch != "\n":
+            return None
+        # Skip unknown characters not in PUNCT_MAP and not speakable
+        if ch not in PUNCT_MAP and not _is_speakable(ch):
+            log.debug("Skipping unsupported char: %r (U+%04X)", ch, ord(ch))
             return None
         filepath = str(self._temp_dir / f"char_{index}.wav")
         speak_char = PUNCT_MAP.get(ch, ch)
@@ -569,28 +601,33 @@ class DictationApp:
 
             # Generate and play audio
             wav_path = self._audio.generate_char_audio(ch, idx)
-            if wav_path:
-                if self._audio.play_file(wav_path):
-                    # Wait for playback to finish
-                    while self._audio.is_playing():
-                        with self._lock:
-                            st = self._state
-                        if st == PlayState.IDLE:
-                            self._audio.stop_current()
-                            break
-                        if st == PlayState.PAUSED:
-                            self._audio.stop_current()
-                            # Wait until resumed
-                            while True:
-                                time.sleep(0.1)
-                                with self._lock:
-                                    st = self._state
-                                if st != PlayState.PAUSED:
-                                    break
-                            break
-                        time.sleep(0.05)
-                # Clean up wav immediately
-                self._audio.cleanup_file(wav_path)
+            if wav_path is None:
+                # Unsupported char: skip quickly, no wait
+                idx += 1
+                with self._lock:
+                    self._current_index = idx
+                continue
+            if self._audio.play_file(wav_path):
+                # Wait for playback to finish
+                while self._audio.is_playing():
+                    with self._lock:
+                        st = self._state
+                    if st == PlayState.IDLE:
+                        self._audio.stop_current()
+                        break
+                    if st == PlayState.PAUSED:
+                        self._audio.stop_current()
+                        # Wait until resumed
+                        while True:
+                            time.sleep(0.1)
+                            with self._lock:
+                                st = self._state
+                            if st != PlayState.PAUSED:
+                                break
+                        break
+                    time.sleep(0.05)
+            # Clean up wav immediately
+            self._audio.cleanup_file(wav_path)
 
             if not self._sleep_check(interval):
                 break
