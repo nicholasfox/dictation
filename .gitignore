@@ -6,5 +6,4 @@ dist/
 build/
 *.log
 logs/
-config.json
 temp/

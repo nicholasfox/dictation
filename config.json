@@ -1,0 +1,15 @@
+{
+  "title": "付仲豪日记朗读器",
+  "font_family": "STKaiti",
+  "font_size": 32,
+  "tts_rate": 150,
+  "tts_volume": 1.0,
+  "char_interval": 0.5,
+  "interval_min": 0.5,
+  "interval_max": 10.0,
+  "interval_step": 0.5,
+  "settings_height": 120,
+  "text_area_ratio": 0.6,
+  "intro_text": "你好，同学，请认真听，现在开始",
+  "outro_text": "日记完成，你很努力，加油！"
+}

@@ -9,6 +9,7 @@ import sys
 import json
 import logging
 import atexit
+import tempfile
 import shutil
 from enum import Enum, auto
 from pathlib import Path
@@ -38,7 +39,7 @@ log = logging.getLogger("dictation")
 
 # ==================== Configuration ====================
 DEFAULT_CONFIG = {
-    "title": "付仲豪日记朗读器",
+    "title": "听写",
     "font_family": "STKaiti",
     "font_size": 32,
     "tts_rate": 150,
@@ -121,7 +122,6 @@ class AudioManager:
 
     def __init__(self, config: Config):
         self._cfg = config
-        self._engine = None
         self._temp_dir = LOG_DIR / "audio_cache"
         self._temp_dir.mkdir(exist_ok=True)
         self._current_play_obj = None
@@ -132,31 +132,42 @@ class AudioManager:
     def temp_dir(self) -> Path:
         return self._temp_dir
 
-    def _get_engine(self):
-        """Lazy-init TTS engine (pyttsx3 is not thread-safe)."""
-        if self._engine is None:
-            try:
-                self._engine = pyttsx3.init()
-                self._engine.setProperty("rate", self._cfg.tts_rate)
-                self._engine.setProperty("volume", self._cfg.tts_volume)
-            except Exception as e:
-                log.error("Failed to init TTS engine: %s", e)
-                self._engine = None
-        return self._engine
+    def _new_engine(self):
+        """Create a fresh TTS engine (pyttsx3 SAPI5 is not reusable across runAndWait calls)."""
+        try:
+            engine = pyttsx3.init()
+            engine.setProperty("rate", self._cfg.tts_rate)
+            engine.setProperty("volume", self._cfg.tts_volume)
+            return engine
+        except Exception as e:
+            log.error("Failed to init TTS engine: %s", e)
+            return None
 
-    def speak_text_sync(self, text: str):
-        """Synchronous TTS for intro/outro prompts."""
-        engine = self._get_engine()
+    def _speak_to_file(self, text: str, filepath: str) -> bool:
+        """Generate a WAV file from text. Creates a fresh engine each call."""
+        engine = self._new_engine()
         if engine is None:
-            return
-        fd, filepath = tempfile.mkstemp(suffix=".wav", dir=str(self._temp_dir))
-        os.close(fd)
+            return False
         try:
             engine.save_to_file(text, filepath)
             engine.runAndWait()
-            wave_obj = sa.WaveObject.from_wave_file(filepath)
-            play_obj = wave_obj.play()
-            play_obj.wait_done()
+            engine.stop()
+            return os.path.exists(filepath) and os.path.getsize(filepath) > 0
+        except Exception as e:
+            log.error("TTS gen failed for '%s': %s", text[:20], e)
+            return False
+
+    def speak_text_sync(self, text: str):
+        """Synchronous TTS for intro/outro prompts."""
+        fd, filepath = tempfile.mkstemp(suffix=".wav", dir=str(self._temp_dir))
+        os.close(fd)
+        try:
+            if self._speak_to_file(text, filepath):
+                wave_obj = sa.WaveObject.from_wave_file(filepath)
+                play_obj = wave_obj.play()
+                play_obj.wait_done()
+            else:
+                log.warning("Skipping prompt, audio gen failed: %s", text[:20])
         except Exception as e:
             log.error("TTS speak failed for '%s': %s", text[:20], e)
         finally:
@@ -167,19 +178,11 @@ class AudioManager:
         ch_stripped = ch.strip()
         if ch_stripped == "" and ch != "\n":
             return None
-        engine = self._get_engine()
-        if engine is None:
-            return None
-        speak_char = PUNCT_MAP.get(ch, ch)
         filepath = str(self._temp_dir / f"char_{index}.wav")
-        try:
-            time.sleep(0.25)
-            engine.save_to_file(speak_char, filepath)
-            engine.runAndWait()
+        speak_char = PUNCT_MAP.get(ch, ch)
+        if self._speak_to_file(speak_char, filepath):
             return filepath
-        except Exception as e:
-            log.error("Audio gen failed for char '%s' (idx=%d): %s", ch, index, e)
-            return None
+        return None
 
     def play_file(self, filepath: str) -> bool:
         """Play a WAV file. Returns True if started successfully."""
@@ -245,7 +248,10 @@ class DictationApp:
         self._font_size_var = None
         self._interval_label_var = None
         self._word_count_var = None
-        self._pause_button = None
+        self._btn_start = None
+        self._btn_cursor = None
+        self._btn_stop = None
+        self._btn_pause = None
         self._interval_scale = None
 
         self._build_ui()
@@ -288,6 +294,7 @@ class DictationApp:
         self._root.bind("<Escape>", lambda e: self._stop())
 
         self._on_resize()
+        self._update_ui_state()
         log.info("UI built successfully")
 
     def _build_settings(self):
@@ -319,31 +326,57 @@ class DictationApp:
 
         # Row 1: buttons + word count
         btn_font = (cfg.font_family, 14)
-        tk.Button(frame, text="从开头朗读", command=self._speak_from_start,
-                  bg="#4CAF50", fg="white", width=12, font=btn_font
-                  ).grid(row=1, column=0, padx=8, pady=12)
-        tk.Button(frame, text="从光标朗读", command=self._speak_from_cursor,
-                  bg="#2196F3", fg="white", width=12, font=btn_font
-                  ).grid(row=1, column=1, padx=8)
-        tk.Button(frame, text="停止朗读", command=self._stop,
-                  bg="#F44336", fg="white", width=12, font=btn_font
-                  ).grid(row=1, column=2, padx=8)
-        self._pause_button = tk.Button(
-            frame, text="暂停朗读", command=self._pause_resume,
-            bg="#FFC107", fg="black", width=12, font=btn_font)
-        self._pause_button.grid(row=1, column=3, padx=8)
+        self._btn_start = tk.Button(frame, text="从开头朗读", command=self._speak_from_start,
+                  bg="#4CAF50", fg="white", width=12, font=btn_font)
+        self._btn_start.grid(row=1, column=0, padx=8, pady=12)
+        self._btn_cursor = tk.Button(frame, text="从光标朗读", command=self._speak_from_cursor,
+                  bg="#2196F3", fg="white", width=12, font=btn_font)
+        self._btn_cursor.grid(row=1, column=1, padx=8)
+        self._btn_stop = tk.Button(frame, text="停止朗读", command=self._stop,
+                  bg="#F44336", fg="white", width=12, font=btn_font)
+        self._btn_stop.grid(row=1, column=2, padx=8)
+        self._btn_pause = tk.Button(frame, text="暂停朗读", command=self._pause_resume,
+                  bg="#FFC107", fg="black", width=12, font=btn_font)
+        self._btn_pause.grid(row=1, column=3, padx=8)
 
         self._word_count_var = tk.StringVar()
         tk.Label(frame, textvariable=self._word_count_var,
                  font=(cfg.font_family, 16)).grid(row=1, column=4, padx=20)
 
     # ---- Settings callbacks ----
+    def _update_ui_state(self):
+        """Enable/disable controls based on current PlayState."""
+        with self._lock:
+            state = self._state
+        if state == PlayState.IDLE:
+            self._text_box.config(state="normal")
+            self._btn_start.config(state="normal")
+            self._btn_cursor.config(state="normal")
+            self._btn_stop.config(state="disabled")
+            self._btn_pause.config(state="disabled", text="暂停朗读")
+            self._interval_scale.config(state="normal")
+        elif state == PlayState.PLAYING:
+            self._text_box.config(state="disabled")
+            self._btn_start.config(state="disabled")
+            self._btn_cursor.config(state="disabled")
+            self._btn_stop.config(state="normal")
+            self._btn_pause.config(state="normal", text="暂停朗读")
+            self._interval_scale.config(state="disabled")
+        elif state == PlayState.PAUSED:
+            self._text_box.config(state="disabled")
+            self._btn_start.config(state="disabled")
+            self._btn_cursor.config(state="disabled")
+            self._btn_stop.config(state="normal")
+            self._btn_pause.config(state="normal", text="继续朗读")
+            self._interval_scale.config(state="normal")
+
     def _apply_font_size(self):
         try:
             size = int(self._font_size_var.get())
             if 8 <= size <= 120:
                 self._text_box.config(font=(self._cfg.font_family, size))
                 self._cfg.font_size = size
+                self._cfg.save()
             else:
                 log.warning("Font size out of range: %d", size)
         except ValueError:
@@ -354,6 +387,7 @@ class DictationApp:
             val = float(v)
             self._cfg.char_interval = val
             self._interval_label_var.set(f"字符间停顿: {val:.1f}s")
+            self._cfg.save()
         except ValueError:
             pass
 
@@ -403,8 +437,11 @@ class DictationApp:
         if ch and ch != "\n":
             margin = max(int(side * 0.06), 10)
             font_size = max(int((side - 2 * margin) / 1.2), 12)
+            # Shift y up for Latin characters (compensate descender space)
+            is_latin = '\u0020' <= ch <= '\u024F'
+            y_offset = int(font_size * 0.08) if is_latin else 0
             tid = self._canvas.create_text(
-                side / 2, side / 2, text=ch,
+                side / 2, side / 2 - y_offset, text=ch,
                 font=(self._cfg.font_family, font_size),
                 fill="black", tags="char",
             )
@@ -424,12 +461,12 @@ class DictationApp:
 
     # ---- Word Count ----
     @staticmethod
-    def _count_chinese(text: str) -> int:
-        return sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
+    def _count_chars(text: str) -> int:
+        return sum(1 for c in text if not c.isspace())
 
     def _update_word_count(self, text: str, index: int):
-        total = self._count_chinese(text)
-        remaining = self._count_chinese(text[index:])
+        total = self._count_chars(text)
+        remaining = self._count_chars(text[index:])
         self._word_count_var.set(f"共计 {total} 字，剩余 {remaining} 字")
 
     # ---- Playback Control ----
@@ -443,6 +480,7 @@ class DictationApp:
             self._current_index = 0
             self._play_text = text
         self._update_word_count(text, 0)
+        self._root.after(0, self._update_ui_state)
         self._start_play_thread()
 
     def _speak_from_cursor(self):
@@ -457,6 +495,7 @@ class DictationApp:
             self._current_index = idx
             self._play_text = text
         self._update_word_count(text, idx)
+        self._root.after(0, self._update_ui_state)
         self._start_play_thread()
 
     def _start_play_thread(self):
@@ -470,7 +509,6 @@ class DictationApp:
 
     def _stop(self):
         with self._lock:
-            old_state = self._state
             self._state = PlayState.IDLE
         self._audio.stop_current()
         if self._play_thread and self._play_thread.is_alive():
@@ -482,18 +520,16 @@ class DictationApp:
         self._clear_highlight()
         self._update_canvas_char("")
         self._word_count_var.set("")
-        if self._pause_button:
-            self._pause_button.config(text="暂停朗读")
+        self._root.after(0, self._update_ui_state)
 
     def _pause_resume(self):
         with self._lock:
             if self._state == PlayState.PLAYING:
                 self._state = PlayState.PAUSED
                 self._audio.stop_current()
-                self._pause_button.config(text="继续朗读")
             elif self._state == PlayState.PAUSED:
                 self._state = PlayState.PLAYING
-                self._pause_button.config(text="暂停朗读")
+        self._root.after(0, self._update_ui_state)
 
     # ---- Play Loop (runs in thread) ----
     def _play_loop(self):
@@ -563,9 +599,12 @@ class DictationApp:
                 self._current_index = idx
 
         # Finished
+        with self._lock:
+            self._state = PlayState.IDLE
         self._root.after(0, self._clear_highlight)
         self._root.after(0, self._update_canvas_char, "")
         self._root.after(0, self._update_word_count, text, len(text))
+        self._root.after(0, self._update_ui_state)
 
         # Outro prompt
         try:
